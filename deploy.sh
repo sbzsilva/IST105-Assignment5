@@ -57,7 +57,7 @@ else
     echo "Key pair $KEY_NAME already exists"
 fi
 
-# Create Launch Template without IAM role (since we don't have permissions)
+# Create Launch Template with improved user data script
 echo "Creating Launch Template..."
 LT_ID=$(aws ec2 create-launch-template --launch-template-name treasure-hunt-lt --launch-template-data '{
   "ImageId": "ami-04505e74c0741db8d",
@@ -68,18 +68,27 @@ LT_ID=$(aws ec2 create-launch-template --launch-template-name treasure-hunt-lt -
 #!/bin/bash
 yum update -y
 yum install -y git python3 python3-pip
-mkdir -p /home/ec2-user/assignment5
-cd /home/ec2-user/assignment5
-git clone '"$GITHUB_REPO"' .
+cd /home/ec2-user
+git clone '"$GITHUB_REPO"' assignment5
+cd assignment5
 pip3 install -r requirements.txt
+export DJANGO_SETTINGS_MODULE=assignment5.settings
+python3 manage.py migrate
 python3 manage.py collectstatic --noinput
-nohup python3 manage.py runserver 0.0.0.0:8000 &
+python3 manage.py runserver 0.0.0.0:8000 > /home/ec2-user/django.log 2>&1 &
+echo "Django application started" >> /home/ec2-user/deployment.log
 EOF
 )'"}' --query 'LaunchTemplate.LaunchTemplateId' --output text)
 
 # Create Target Group
 echo "Creating Target Group..."
 TG_ARN=$(aws elbv2 create-target-group --name treasure-hunt-tg --protocol HTTP --port 8000 --vpc-id $VPC_ID --health-check-path=/ --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+# Set the load balancing algorithm to Least outstanding requests
+echo "Setting load balancing algorithm to Least outstanding requests..."
+aws elbv2 modify-target-group-attributes \
+    --target-group-arn $TG_ARN \
+    --attributes Key=load_balancing.algorithm.type,Value=least_outstanding_requests
 
 # Create Load Balancer
 echo "Creating Load Balancer..."
