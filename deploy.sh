@@ -30,7 +30,7 @@ check_aws_result "Failed to create Internet Gateway"
 aws ec2 create-tags --resources $IGW_ID --tags Key=Name,Value=treasure-hunt-igw
 aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
 
-# Create Subnets
+# Create Subnets with public IP assignment enabled
 echo "Creating Subnets..."
 SUBNET1_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 --availability-zone ${AWS_REGION}a --query 'Subnet.SubnetId' --output text)
 check_aws_result "Failed to create subnet 1"
@@ -38,6 +38,10 @@ SUBNET2_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.2.0/24 --a
 check_aws_result "Failed to create subnet 2"
 aws ec2 create-tags --resources $SUBNET1_ID --tags Key=Name,Value=treasure-hunt-subnet-1
 aws ec2 create-tags --resources $SUBNET2_ID --tags Key=Name,Value=treasure-hunt-subnet-2
+
+# Enable auto-assign public IP for subnets
+aws ec2 modify-subnet-attribute --subnet-id $SUBNET1_ID --map-public-ip-on-launch
+aws ec2 modify-subnet-attribute --subnet-id $SUBNET2_ID --map-public-ip-on-launch
 
 # Create Route Table
 echo "Creating Route Table..."
@@ -57,7 +61,6 @@ aws ec2 authorize-security-group-ingress --group-id $LB_SG_ID --protocol tcp --p
 INSTANCE_SG_ID=$(aws ec2 create-security-group --group-name treasure-hunt-instance-sg --description "Security group for EC2 instances" --vpc-id $VPC_ID --query 'GroupId' --output text)
 check_aws_result "Failed to create instance security group"
 aws ec2 authorize-security-group-ingress --group-id $INSTANCE_SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
-aws ec2 authorize-security-group-ingress --group-id $INSTANCE_SG_ID --protocol tcp --port 8000 --cidr 0.0.0.0/0  # Allow from anywhere for debugging
 aws ec2 authorize-security-group-ingress --group-id $INSTANCE_SG_ID --protocol tcp --port 8000 --source-group $LB_SG_ID
 
 # Create the key pair if it doesn't exist
@@ -73,100 +76,62 @@ else
     echo "Key pair $KEY_NAME already exists"
 fi
 
-# Create user data script with better error handling and logging
+# Create user data script
 cat > /tmp/userdata.sh << 'EOF'
 #!/bin/bash
-exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
-
-echo "Starting user data script..."
-
-# Update and install dependencies
 yum update -y
-yum install -y git python3 python3-pip stress
+yum install -y git python3 python3-pip
 
-# Clone and setup application
+# Change to ec2-user home directory
 cd /home/ec2-user
+
+# Clone the repository
 git clone https://github.com/sbzsilva/IST105-Assignment5.git assignment5
 cd assignment5
 
 # Install Python dependencies
 pip3 install -r requirements.txt
 
-# Create a proper systemd service for Django
-cat > /etc/systemd/system/djangoapp.service << 'SERVICEEOF'
-[Unit]
-Description=Django Application
-After=network.target
-
-[Service]
-Type=simple
-User=ec2-user
-WorkingDirectory=/home/ec2-user/assignment5
-Environment=DJANGO_SETTINGS_MODULE=assignment5.settings
-Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 manage.py runserver 0.0.0.0:8000
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-SERVICEEOF
-
-# Setup Django
+# Set environment variables
 export DJANGO_SETTINGS_MODULE=assignment5.settings
+
+# Run database migrations
 python3 manage.py migrate
+
+# Collect static files
 python3 manage.py collectstatic --noinput
 
-# Start the Django service
-systemctl daemon-reload
-systemctl enable djangoapp.service
-systemctl start djangoapp.service
+# Update settings to allow all hosts (for testing)
+sed -i "s/ALLOWED_HOSTS = \['\*'\]/ALLOWED_HOSTS = \['\*', '0.0.0.0'\]/" assignment5/settings.py
 
-# Wait a bit and check status
-sleep 10
-systemctl status djangoapp.service
+# Start Django application
+python3 manage.py runserver 0.0.0.0:8000 > /home/ec2-user/django.log 2>&1 &
 
-# Also check if the app is listening on port 8000
-netstat -tlnp | grep 8000 || echo "Application not listening on port 8000"
-
-echo "User data script completed"
+# Log that the application has started
+echo "Django application started on port 8000" >> /home/ec2-user/deployment.log
 EOF
 
-# Base64 encode the user data script
+# Base64 encode the user data script (compatible with all systems)
 USER_DATA=$(base64 /tmp/userdata.sh | tr -d '\n')
 
-# Use Amazon Linux 2 AMI (more stable)
-AMI_ID="ami-0c02fb55956c7d316"  # Amazon Linux 2 in us-east-1
-
-# Create Launch Template
+# Create Launch Template with improved user data script and public IP assignment
 echo "Creating Launch Template..."
 LT_ID=$(aws ec2 create-launch-template --launch-template-name treasure-hunt-lt --launch-template-data '{
-  "ImageId": "'"$AMI_ID"'",
+  "ImageId": "ami-09d3b3274b6c5d4aa",
   "InstanceType": "'"$INSTANCE_TYPE"'",
   "KeyName": "'"$KEY_NAME"'",
   "SecurityGroupIds": ["'"$INSTANCE_SG_ID"'"],
-  "UserData": "'"$USER_DATA"'"
+  "UserData": "'"$USER_DATA"'",
+  "AssociatePublicIpAddress": true
 }' --query 'LaunchTemplate.LaunchTemplateId' --output text)
 check_aws_result "Failed to create launch template"
 
-# Create Target Group with better health check settings
+# Create Target Group with proper health check settings
 echo "Creating Target Group..."
-TG_ARN=$(aws elbv2 create-target-group \
-  --name treasure-hunt-tg \
-  --protocol HTTP \
-  --port 8000 \
-  --vpc-id $VPC_ID \
-  --health-check-protocol HTTP \
-  --health-check-port 8000 \
-  --health-check-path="/" \
-  --health-check-interval-seconds 30 \
-  --health-check-timeout-seconds 5 \
-  --healthy-threshold-count 2 \
-  --unhealthy-threshold-count 2 \
-  --query 'TargetGroups[0].TargetGroupArn' --output text)
+TG_ARN=$(aws elbv2 create-target-group --name treasure-hunt-tg --protocol HTTP --port 8000 --vpc-id $VPC_ID --health-check-path=/ --health-check-port 8000 --health-check-protocol HTTP --query 'TargetGroups[0].TargetGroupArn' --output text)
 check_aws_result "Failed to create target group"
 
-# Set the load balancing algorithm
+# Set the load balancing algorithm to Least outstanding requests
 echo "Setting load balancing algorithm to Least outstanding requests..."
 aws elbv2 modify-target-group-attributes \
     --target-group-arn $TG_ARN \
@@ -183,7 +148,7 @@ echo "Creating Listener..."
 aws elbv2 create-listener --load-balancer-arn $LB_ARN --protocol HTTP --port 80 --default-actions Type=forward,TargetGroupArn=$TG_ARN
 check_aws_result "Failed to create listener"
 
-# Create Auto Scaling Group
+# Create Auto Scaling Group with proper subnet configuration for public IPs
 echo "Creating Auto Scaling Group..."
 aws autoscaling create-auto-scaling-group \
   --auto-scaling-group-name treasure-hunt-asg \
@@ -197,27 +162,30 @@ aws autoscaling create-auto-scaling-group \
   --health-check-grace-period 300
 check_aws_result "Failed to create auto scaling group"
 
-echo "Waiting for instances to be healthy (this may take 2-3 minutes)..."
-sleep 120
+# Give the ASG a moment to create
+sleep 10
 
-# Check target health
-echo "Checking target health status..."
-aws elbv2 describe-target-health --target-group-arn $TG_ARN
+# Check if ASG was created successfully
+ASG_EXISTS=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names treasure-hunt-asg 2>&1 || echo "NOT_FOUND")
 
-# Create Scaling Policy
-echo "Creating Scaling Policy..."
-aws autoscaling put-scaling-policy \
-  --policy-name cpu-scaling-policy \
-  --auto-scaling-group-name treasure-hunt-asg \
-  --policy-type TargetTrackingScaling \
-  --target-tracking-configuration '{
-    "PredefinedMetricSpecification": {
-      "PredefinedMetricType": "ASGAverageCPUUtilization"
-    },
-    "TargetValue": 10,
-    "DisableScaleIn": false
-  }'
-check_aws_result "Failed to create scaling policy"
+if [[ $ASG_EXISTS != *"NOT_FOUND"* ]]; then
+    # Create Scaling Policy
+    echo "Creating Scaling Policy..."
+    aws autoscaling put-scaling-policy \
+      --policy-name cpu-scaling-policy \
+      --auto-scaling-group-name treasure-hunt-asg \
+      --policy-type TargetTrackingScaling \
+      --target-tracking-configuration '{
+        "PredefinedMetricSpecification": {
+          "PredefinedMetricType": "ASGAverageCPUUtilization"
+        },
+        "TargetValue": 10,
+        "DisableScaleIn": false
+      }'
+    check_aws_result "Failed to create scaling policy"
+else
+    echo "Auto Scaling Group was not created successfully. Skipping scaling policy creation."
+fi
 
 # Clean up temporary file
 rm /tmp/userdata.sh
@@ -226,6 +194,3 @@ rm /tmp/userdata.sh
 echo "Deployment complete!"
 echo "Load Balancer DNS: http://$LB_DNS"
 echo "Access your application at: http://$LB_DNS"
-echo ""
-echo "If you see unhealthy targets, wait a few minutes and check again:"
-echo "aws elbv2 describe-target-health --target-group-arn $TG_ARN"
