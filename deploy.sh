@@ -44,43 +44,20 @@ INSTANCE_SG_ID=$(aws ec2 create-security-group --group-name treasure-hunt-instan
 aws ec2 authorize-security-group-ingress --group-id $INSTANCE_SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
 aws ec2 authorize-security-group-ingress --group-id $INSTANCE_SG_ID --protocol tcp --port 8000 --source-group $LB_SG_ID
 
-# Create IAM Role
-echo "Creating IAM Role..."
-aws iam create-role --role-name treasure-hunt-ec2-role --assume-role-policy-document '{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {"Service": "ec2.amazonaws.com"},
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}'
-
-aws iam attach-role-policy --role-name treasure-hunt-ec2-role --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-aws iam attach-role-policy --role-name treasure-hunt-ec2-role --policy-arn arn:aws:iam::aws:policy/AmazonEC2FullAccess
-
-INSTANCE_PROFILE_NAME="treasure-hunt-instance-profile"
-aws iam create-instance-profile --instance-profile-name $INSTANCE_PROFILE_NAME
-aws iam add-role-to-instance-profile --instance-profile-name $INSTANCE_PROFILE_NAME --role-name treasure-hunt-ec2-role
-
-# Create Launch Template
+# Create Launch Template without IAM role (since we don't have permissions)
 echo "Creating Launch Template..."
 LT_ID=$(aws ec2 create-launch-template --launch-template-name treasure-hunt-lt --launch-template-data '{
-  "ImageId": "ami-0c55b159cbfafe1f0",
+  "ImageId": "ami-04505e74c0741db8d",
   "InstanceType": "'"$INSTANCE_TYPE"'",
   "KeyName": "'"$KEY_NAME"'",
   "SecurityGroupIds": ["'"$INSTANCE_SG_ID"'"],
-  "IamInstanceProfile": {
-    "Name": "'"$INSTANCE_PROFILE_NAME"'"
-  },
   "UserData": "'$(base64 -w0 <<'EOF'
 #!/bin/bash
 yum update -y
 yum install -y git python3 python3-pip
 mkdir -p /home/ec2-user/assignment5
 cd /home/ec2-user/assignment5
-git clone $GITHUB_REPO .
+git clone '"$GITHUB_REPO"' .
 pip3 install -r requirements.txt
 python3 manage.py collectstatic --noinput
 nohup python3 manage.py runserver 0.0.0.0:8000 &
@@ -127,10 +104,6 @@ aws autoscaling put-scaling-policy \
     "TargetValue": 10,
     "DisableScaleIn": false
   }'
-
-# Wait for instances to be ready
-echo "Waiting for instances to be ready..."
-aws autoscaling wait group-in-service --auto-scaling-group-names $ASG_NAME
 
 # Output results
 echo "Deployment complete!"

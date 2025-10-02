@@ -13,12 +13,6 @@ aws elbv2 delete-target-group --target-group-arn $TG_ARN
 # Delete Launch Template
 aws ec2 delete-launch-template --launch-template-name treasure-hunt-lt
 
-# Delete IAM Role and Instance Profile
-aws iam remove-role-from-instance-profile --instance-profile-name treasure-hunt-instance-profile --role-name treasure-hunt-ec2-role
-aws iam delete-instance-profile --instance-profile-name treasure-hunt-instance-profile
-aws iam detach-role-policy --role-name treasure-hunt-ec2-role --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-aws iam detach-role-policy --role-name treasure-hunt-ec2-role --policy-arn arn:aws:iam::aws:policy/AmazonEC2FullAccess
-aws iam delete-role --role-name treasure-hunt-ec2-role
 
 # Delete Security Groups
 aws ec2 delete-security-group --group-id treasure-hunt-instance-sg
