@@ -120,9 +120,14 @@ LT_ID=$(aws ec2 create-launch-template --launch-template-name treasure-hunt-lt -
   "ImageId": "ami-09d3b3274b6c5d4aa",
   "InstanceType": "'"$INSTANCE_TYPE"'",
   "KeyName": "'"$KEY_NAME"'",
-  "SecurityGroupIds": ["'"$INSTANCE_SG_ID"'"],
   "UserData": "'"$USER_DATA"'",
-  "AssociatePublicIpAddress": true
+  "NetworkInterfaces": [
+    {
+      "DeviceIndex": 0,
+      "AssociatePublicIpAddress": true,
+      "Groups": ["'"$INSTANCE_SG_ID"'"]
+    }
+  ]
 }' --query 'LaunchTemplate.LaunchTemplateId' --output text)
 check_aws_result "Failed to create launch template"
 
