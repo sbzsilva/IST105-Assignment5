@@ -57,6 +57,7 @@ aws ec2 authorize-security-group-ingress --group-id $LB_SG_ID --protocol tcp --p
 INSTANCE_SG_ID=$(aws ec2 create-security-group --group-name treasure-hunt-instance-sg --description "Security group for EC2 instances" --vpc-id $VPC_ID --query 'GroupId' --output text)
 check_aws_result "Failed to create instance security group"
 aws ec2 authorize-security-group-ingress --group-id $INSTANCE_SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id $INSTANCE_SG_ID --protocol tcp --port 8000 --cidr 0.0.0.0/0  # Allow from anywhere for debugging
 aws ec2 authorize-security-group-ingress --group-id $INSTANCE_SG_ID --protocol tcp --port 8000 --source-group $LB_SG_ID
 
 # Create the key pair if it doesn't exist
@@ -72,29 +73,75 @@ else
     echo "Key pair $KEY_NAME already exists"
 fi
 
-# Create user data script
+# Create user data script with better error handling and logging
 cat > /tmp/userdata.sh << 'EOF'
 #!/bin/bash
+exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+echo "Starting user data script..."
+
+# Update and install dependencies
 yum update -y
-yum install -y git python3 python3-pip
+yum install -y git python3 python3-pip stress
+
+# Clone and setup application
 cd /home/ec2-user
 git clone https://github.com/sbzsilva/IST105-Assignment5.git assignment5
 cd assignment5
+
+# Install Python dependencies
 pip3 install -r requirements.txt
+
+# Create a proper systemd service for Django
+cat > /etc/systemd/system/djangoapp.service << 'SERVICEEOF'
+[Unit]
+Description=Django Application
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/assignment5
+Environment=DJANGO_SETTINGS_MODULE=assignment5.settings
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 manage.py runserver 0.0.0.0:8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+# Setup Django
 export DJANGO_SETTINGS_MODULE=assignment5.settings
 python3 manage.py migrate
 python3 manage.py collectstatic --noinput
-python3 manage.py runserver 0.0.0.0:8000 > /home/ec2-user/django.log 2>&1 &
-echo "Django application started" >> /home/ec2-user/deployment.log
+
+# Start the Django service
+systemctl daemon-reload
+systemctl enable djangoapp.service
+systemctl start djangoapp.service
+
+# Wait a bit and check status
+sleep 10
+systemctl status djangoapp.service
+
+# Also check if the app is listening on port 8000
+netstat -tlnp | grep 8000 || echo "Application not listening on port 8000"
+
+echo "User data script completed"
 EOF
 
-# Base64 encode the user data script (compatible with all systems)
+# Base64 encode the user data script
 USER_DATA=$(base64 /tmp/userdata.sh | tr -d '\n')
 
-# Create Launch Template with improved user data script
+# Use Amazon Linux 2 AMI (more stable)
+AMI_ID="ami-0c02fb55956c7d316"  # Amazon Linux 2 in us-east-1
+
+# Create Launch Template
 echo "Creating Launch Template..."
 LT_ID=$(aws ec2 create-launch-template --launch-template-name treasure-hunt-lt --launch-template-data '{
-  "ImageId": "ami-09d3b3274b6c5d4aa",
+  "ImageId": "'"$AMI_ID"'",
   "InstanceType": "'"$INSTANCE_TYPE"'",
   "KeyName": "'"$KEY_NAME"'",
   "SecurityGroupIds": ["'"$INSTANCE_SG_ID"'"],
@@ -102,12 +149,24 @@ LT_ID=$(aws ec2 create-launch-template --launch-template-name treasure-hunt-lt -
 }' --query 'LaunchTemplate.LaunchTemplateId' --output text)
 check_aws_result "Failed to create launch template"
 
-# Create Target Group
+# Create Target Group with better health check settings
 echo "Creating Target Group..."
-TG_ARN=$(aws elbv2 create-target-group --name treasure-hunt-tg --protocol HTTP --port 8000 --vpc-id $VPC_ID --health-check-path=/ --query 'TargetGroups[0].TargetGroupArn' --output text)
+TG_ARN=$(aws elbv2 create-target-group \
+  --name treasure-hunt-tg \
+  --protocol HTTP \
+  --port 8000 \
+  --vpc-id $VPC_ID \
+  --health-check-protocol HTTP \
+  --health-check-port 8000 \
+  --health-check-path="/" \
+  --health-check-interval-seconds 30 \
+  --health-check-timeout-seconds 5 \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 2 \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
 check_aws_result "Failed to create target group"
 
-# Set the load balancing algorithm to Least outstanding requests
+# Set the load balancing algorithm
 echo "Setting load balancing algorithm to Least outstanding requests..."
 aws elbv2 modify-target-group-attributes \
     --target-group-arn $TG_ARN \
@@ -138,30 +197,27 @@ aws autoscaling create-auto-scaling-group \
   --health-check-grace-period 300
 check_aws_result "Failed to create auto scaling group"
 
-# Give the ASG a moment to create
-sleep 10
+echo "Waiting for instances to be healthy (this may take 2-3 minutes)..."
+sleep 120
 
-# Check if ASG was created successfully
-ASG_EXISTS=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names treasure-hunt-asg 2>&1 || echo "NOT_FOUND")
+# Check target health
+echo "Checking target health status..."
+aws elbv2 describe-target-health --target-group-arn $TG_ARN
 
-if [[ $ASG_EXISTS != *"NOT_FOUND"* ]]; then
-    # Create Scaling Policy
-    echo "Creating Scaling Policy..."
-    aws autoscaling put-scaling-policy \
-      --policy-name cpu-scaling-policy \
-      --auto-scaling-group-name treasure-hunt-asg \
-      --policy-type TargetTrackingScaling \
-      --target-tracking-configuration '{
-        "PredefinedMetricSpecification": {
-          "PredefinedMetricType": "ASGAverageCPUUtilization"
-        },
-        "TargetValue": 10,
-        "DisableScaleIn": false
-      }'
-    check_aws_result "Failed to create scaling policy"
-else
-    echo "Auto Scaling Group was not created successfully. Skipping scaling policy creation."
-fi
+# Create Scaling Policy
+echo "Creating Scaling Policy..."
+aws autoscaling put-scaling-policy \
+  --policy-name cpu-scaling-policy \
+  --auto-scaling-group-name treasure-hunt-asg \
+  --policy-type TargetTrackingScaling \
+  --target-tracking-configuration '{
+    "PredefinedMetricSpecification": {
+      "PredefinedMetricType": "ASGAverageCPUUtilization"
+    },
+    "TargetValue": 10,
+    "DisableScaleIn": false
+  }'
+check_aws_result "Failed to create scaling policy"
 
 # Clean up temporary file
 rm /tmp/userdata.sh
@@ -170,3 +226,6 @@ rm /tmp/userdata.sh
 echo "Deployment complete!"
 echo "Load Balancer DNS: http://$LB_DNS"
 echo "Access your application at: http://$LB_DNS"
+echo ""
+echo "If you see unhealthy targets, wait a few minutes and check again:"
+echo "aws elbv2 describe-target-health --target-group-arn $TG_ARN"
