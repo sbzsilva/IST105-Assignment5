@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Configuration - Update these values
-KEY_NAME="your-key-pair-name"
-GITHUB_REPO="https://github.com/YOUR_USERNAME/IST105-Assignment5.git"
+KEY_NAME="cctb"
+GITHUB_REPO="https://github.com/sbzsilva/IST105-Assignment5.git"
 AWS_REGION="us-east-1"
 INSTANCE_TYPE="t2.micro"
 MIN_SIZE=1
@@ -43,6 +43,19 @@ aws ec2 authorize-security-group-ingress --group-id $LB_SG_ID --protocol tcp --p
 INSTANCE_SG_ID=$(aws ec2 create-security-group --group-name treasure-hunt-instance-sg --description "Security group for EC2 instances" --vpc-id $VPC_ID --query 'GroupId' --output text)
 aws ec2 authorize-security-group-ingress --group-id $INSTANCE_SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
 aws ec2 authorize-security-group-ingress --group-id $INSTANCE_SG_ID --protocol tcp --port 8000 --source-group $LB_SG_ID
+
+# Create the key pair if it doesn't exist
+echo "Checking if key pair exists..."
+KEY_CHECK=$(aws ec2 describe-key-pairs --key-names $KEY_NAME 2>&1 || echo "NOT_FOUND")
+
+if [[ $KEY_CHECK == *"NOT_FOUND"* ]]; then
+    echo "Creating key pair: $KEY_NAME"
+    aws ec2 create-key-pair --key-name $KEY_NAME --query 'KeyMaterial' --output text > ${KEY_NAME}.pem
+    chmod 400 ${KEY_NAME}.pem
+    echo "Key pair created and saved to ${KEY_NAME}.pem"
+else
+    echo "Key pair $KEY_NAME already exists"
+fi
 
 # Create Launch Template without IAM role (since we don't have permissions)
 echo "Creating Launch Template..."
@@ -91,19 +104,29 @@ aws autoscaling create-auto-scaling-group \
   --health-check-type ELB \
   --health-check-grace-period 300
 
-# Create Scaling Policy
-echo "Creating Scaling Policy..."
-aws autoscaling put-scaling-policy \
-  --policy-name cpu-scaling-policy \
-  --auto-scaling-group-name $ASG_NAME \
-  --policy-type TargetTrackingScaling \
-  --target-tracking-configuration '{
-    "PredefinedMetricSpecification": {
-      "PredefinedMetricType": "ASGAverageCPUUtilization"
-    },
-    "TargetValue": 10,
-    "DisableScaleIn": false
-  }'
+# Give the ASG a moment to create
+sleep 10
+
+# Check if ASG was created successfully
+ASG_EXISTS=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names $ASG_NAME 2>&1 || echo "NOT_FOUND")
+
+if [[ $ASG_EXISTS != *"NOT_FOUND"* ]]; then
+    # Create Scaling Policy
+    echo "Creating Scaling Policy..."
+    aws autoscaling put-scaling-policy \
+      --policy-name cpu-scaling-policy \
+      --auto-scaling-group-name $ASG_NAME \
+      --policy-type TargetTrackingScaling \
+      --target-tracking-configuration '{
+        "PredefinedMetricSpecification": {
+          "PredefinedMetricType": "ASGAverageCPUUtilization"
+        },
+        "TargetValue": 10,
+        "DisableScaleIn": false
+      }'
+else
+    echo "Auto Scaling Group was not created successfully. Skipping scaling policy creation."
+fi
 
 # Output results
 echo "Deployment complete!"
