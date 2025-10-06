@@ -35,18 +35,36 @@ for INSTANCE_ID in $INSTANCE_IDS; do
         SG_IDS=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].SecurityGroups[*].GroupId' --output text 2>/dev/null)
         echo "Security Group IDs: $SG_IDS"
         
-        # Test direct access to the application
-        echo "Testing direct access to Django application on port 8000..."
-        curl -v http://$PUBLIC_IP:8000
-        
-        # Show log file from instance
-        echo "Checking application logs..."
+        # Test SSH connection first
+        echo "Testing SSH connection..."
         chmod 400 cctb.pem
+        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "echo 'SSH connection successful'"
+        
+        # Check if Django process is running
+        echo "Checking Django processes..."
+        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "ps aux | grep python | grep runserver"
+        
+        # Check application status via localhost (internal test)
+        echo "Testing application internally on the instance..."
+        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "curl -s http://localhost:8000 > /dev/null && echo 'Application is running internally' || echo 'Application not running internally'"
+        
+        # Show recent log file from instance
+        echo "Checking application logs..."
         ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "tail -n 20 /home/ec2-user/django.log"
+        
+        # Install stress from EPEL repository
+        echo "Installing stress tool..."
+        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "sudo yum install -y epel-release && sudo yum install -y stress"
         
         # Run stress test
         echo "Running stress test on the instance..."
-        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "sudo yum install -y stress && stress --cpu 6 --timeout 120"
+        echo "This will run for 2 minutes with 4 CPU workers..."
+        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "stress --cpu 4 --timeout 120"
+        
+        # Monitor CPU usage after stress test
+        echo "Monitoring CPU usage..."
+        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "top -bn1 | head -10"
+        
         exit 0
     fi
 done
