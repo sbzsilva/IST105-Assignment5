@@ -4,9 +4,9 @@
 KEY_NAME="cctb"
 GITHUB_REPO="https://github.com/sbzsilva/IST105-Assignment5.git"
 AWS_REGION="us-east-1"
-INSTANCE_TYPE="t2.micro"
+INSTANCE_TYPE="t3.micro"
 MIN_SIZE=1
-MAX_SIZE=5
+MAX_SIZE=8
 DESIRED_CAPACITY=1
 
 # Function to check if AWS command succeeded
