@@ -82,6 +82,23 @@ cat > /tmp/userdata.sh << 'EOF'
 yum update -y
 yum install -y git python3 python3-pip
 
+# Install newer SQLite version
+yum install -y gcc make
+cd /tmp
+wget https://www.sqlite.org/2023/sqlite-autoconf-3430200.tar.gz
+tar xzf sqlite-autoconf-3430200.tar.gz
+cd sqlite-autoconf-3430200
+./configure
+make
+make install
+
+# Update library path
+echo "/usr/local/lib" >> /etc/ld.so.conf
+ldconfig
+
+# Verify SQLite version
+/usr/local/bin/sqlite3 --version
+
 # Change to ec2-user home directory
 cd /home/ec2-user
 
