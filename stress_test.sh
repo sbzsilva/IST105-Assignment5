@@ -30,40 +30,66 @@ for INSTANCE_ID in $INSTANCE_IDS; do
         echo "Instance ID: $INSTANCE_ID"
         echo "Public IP: $PUBLIC_IP"
         
-        # Show security group information
-        echo "Checking security group settings..."
-        SG_IDS=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].SecurityGroups[*].GroupId' --output text 2>/dev/null)
-        echo "Security Group IDs: $SG_IDS"
-        
-        # Test SSH connection first
-        echo "Testing SSH connection..."
         chmod 400 cctb.pem
-        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "echo 'SSH connection successful'"
         
-        # Check if Django process is running
-        echo "Checking Django processes..."
-        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "ps aux | grep python | grep runserver"
-        
-        # Check application status via localhost (internal test)
-        echo "Testing application internally on the instance..."
-        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "curl -s http://localhost:8000 > /dev/null && echo 'Application is running internally' || echo 'Application not running internally'"
-        
-        # Show recent log file from instance
-        echo "Checking application logs..."
-        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "tail -n 20 /home/ec2-user/django.log"
-        
-        # Install stress from EPEL repository
+        # Install stress using a reliable method
         echo "Installing stress tool..."
-        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "sudo yum install -y epel-release && sudo yum install -y stress"
+        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP << 'EOF'
+# Install dependencies
+sudo yum update -y
+sudo yum install -y gcc make wget
+
+# Download and compile stress from a reliable source
+cd /tmp
+rm -rf stress-*
+wget http://ftp.debian.org/debian/pool/main/s/stress/stress_1.0.4.orig.tar.gz
+tar xzf stress_1.0.4.orig.tar.gz
+cd stress-1.0.4
+./configure
+make
+sudo make install
+
+# Verify installation
+echo "Stress installation check:"
+which stress || echo "Stress not in PATH"
+/usr/local/bin/stress --version || echo "Cannot run stress"
+EOF
+
+        # Verify stress is installed and run the test FOREGROUND
+        echo "Starting 10-minute stress test..."
+        echo "Expected: CPU should show ~200% usage, load average ~4.0"
+        echo "Starting at: $(date)"
         
-        # Run stress test
-        echo "Running stress test on the instance..."
-        echo "This will run for 2 minutes with 4 CPU workers..."
-        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "stress --cpu 4 --timeout 120"
+        # Run stress test in FOREGROUND so we can see if it works
+        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "/usr/local/bin/stress --cpu 4 --timeout 600" &
+        STRESS_PID=$!
         
-        # Monitor CPU usage after stress test
-        echo "Monitoring CPU usage..."
-        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "top -bn1 | head -10"
+        # Monitor every 10 seconds for the first minute to verify it's working
+        for i in {1..6}; do
+            sleep 10
+            echo "Progress: $((i * 10)) seconds / 600 seconds"
+            
+            echo "Current CPU usage:"
+            ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "top -bn1 | grep 'Cpu(s)' | head -1"
+            
+            echo "Load average:"
+            ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "uptime"
+            
+            echo "Running processes (stress should appear):"
+            ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "ps aux | grep stress | grep -v grep"
+            
+            echo "Application health:"
+            ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "curl -s http://localhost:8000 > /dev/null && echo '✓ OK' || echo '✗ FAILED'"
+            echo "---"
+        done
+        
+        # Wait for stress test to complete
+        echo "Waiting for stress test to complete..."
+        wait $STRESS_PID
+        
+        echo "Stress test finished at: $(date)"
+        echo "Final system status:"
+        ssh -o StrictHostKeyChecking=no -i cctb.pem ec2-user@$PUBLIC_IP "uptime; free -h"
         
         exit 0
     fi
