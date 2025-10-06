@@ -7,7 +7,7 @@ AWS_REGION="us-east-1"
 INSTANCE_TYPE="t3.micro"
 MIN_SIZE=1
 MAX_SIZE=5
-DESIRED_CAPACITY=1
+DESIRED_CAPACITY=2
 
 # Function to check if AWS command succeeded
 check_aws_result() {
